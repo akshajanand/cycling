@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cycle Safety Assist Pro</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.12.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+<style>
+  body { margin:0; background:black; text-align:center; color:white; font-family:Arial; }
+  #uiContainer { display:block; transition:opacity 0.3s; }
+  video { width:100%; height:auto; }
+  canvas { position:absolute; top:0; left:0; z-index:2; }
+  button, input { margin:10px; padding:10px 20px; font-size:16px; cursor:pointer; border-radius:8px; border:none; }
+  label { font-size:16px; }
+  #cameraStatus { font-size:18px; margin-top:5px; }
+  #alertText { font-size:28px; color:red; font-weight:bold; margin-top:10px; }
+  #speedDisplay { font-size:22px; margin-top:10px; color:cyan; font-weight:bold; }
+  #highAlertOverlay { position:fixed; top:0; left:0; width:100%; height:100%; background:red; opacity:0.5; display:none; z-index:999; }
+  #bagModeIndicator { color:yellow; font-weight:bold; display:none; position:fixed; bottom:10px; left:50%; transform:translateX(-50%); z-index:999; }
+</style>
+</head>
+<body>
+
+<h2>Cycle Safety Assist Pro</h2>
+<div id="uiContainer">
+  <button id="switchBtn">Switch Camera</button>
+  <button id="captureScreenBtn">Capture Drone App Feed</button>
+  <p id="cameraStatus">Current Camera: </p>
+
+  <label for="thresholdSlider">Normal Alert Threshold: <span id="thresholdValue">100</span> px</label><br>
+  <input type="range" id="thresholdSlider" min="80" max="120" value="100">
+
+  <video id="camFeed" autoplay muted playsinline></video>
+  <canvas id="canvas"></canvas>
+  <div id="highAlertOverlay"></div>
+  <p id="alertText"></p>
+  <p id="speedDisplay">Speed: 0 km/h</p>
+</div>
+
+<div id="bagModeIndicator">Bag Mode Active</div>
+
+<script>
+let video = document.getElementById('camFeed');
+let canvas = document.getElementById('canvas');
+let ctx = canvas.getContext('2d');
+let cameraStatus = document.getElementById('cameraStatus');
+let alertText = document.getElementById('alertText');
+let highOverlay = document.getElementById('highAlertOverlay');
+let uiContainer = document.getElementById('uiContainer');
+let speedDisplay = document.getElementById('speedDisplay');
+
+let CLOSE_OBJECT_THRESHOLD = 100; // normal alert
+let HIGH_ALERT_THRESHOLD = 150;   // high alert
+const DETECTION_WIDTH = 640;
+const DETECTION_HEIGHT = 480;
+
+let cameraOptions = [];
+let currentCameraIndex = 0;
+let model;
+const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+let spoken = new Set();
+
+// Overspeed settings
+const SPEED_LIMIT = 25; // km/h
+let lastSpeedAlertTime = 0;
+
+// --- Initialize ---
+async function init() {
+  model = await cocoSsd.load();
+
+  if(isMobile) cameraOptions.push('Phone Rear Camera');
+  cameraOptions.push('Laptop/Webcam');
+
+  await startCamera(cameraOptions[currentCameraIndex]);
+
+  document.getElementById('switchBtn').addEventListener('click', async () => {
+    currentCameraIndex = (currentCameraIndex + 1) % cameraOptions.length;
+    await startCamera(cameraOptions[currentCameraIndex]);
+  });
+
+  document.getElementById('captureScreenBtn').addEventListener('click', captureDroneAppScreen);
+
+  const slider = document.getElementById('thresholdSlider');
+  const valueLabel = document.getElementById('thresholdValue');
+  slider.addEventListener('input', () => {
+    CLOSE_OBJECT_THRESHOLD = parseInt(slider.value);
+    valueLabel.innerText = CLOSE_OBJECT_THRESHOLD;
+  });
+
+  // Bag mode detection
+  document.addEventListener("visibilitychange", () => {
+    if(document.hidden){
+      uiContainer.style.opacity="0";
+      document.getElementById('bagModeIndicator').style.display='block';
+      speakMessage("Cycle Safety running in background, bag mode active");
+    } else {
+      uiContainer.style.opacity="1";
+      document.getElementById('bagModeIndicator').style.display='none';
+    }
+  });
+
+  // Start GPS Speed Tracking
+  if(navigator.geolocation){
+    navigator.geolocation.watchPosition(updateSpeed, err=>console.log(err), { enableHighAccuracy:true, maximumAge:1000 });
+  }
+}
+
+// --- Start Camera ---
+async function startCamera(type){
+  if(video.srcObject){
+    video.srcObject.getTracks().forEach(track=>track.stop());
+    video.srcObject=null;
+  }
+
+  cameraStatus.innerText = `Current Camera: ${type}`;
+
+  if(type==='Phone Rear Camera'){
+    if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+      video.srcObject = await navigator.mediaDevices.getUserMedia({ video:{facingMode:"environment"}, audio:false });
+    }
+  } else { // Laptop/Webcam
+    if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+      video.srcObject = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+    }
+  }
+
+  video.addEventListener('loadeddata', ()=>{
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    detectFrame();
+  });
+}
+
+// --- Capture Drone App Screen ---
+async function captureDroneAppScreen(){
+  try{
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video:true });
+    video.srcObject = stream;
+    video.style.display = 'block';
+    cameraStatus.innerText = "Current Camera: Drone App Screen";
+  } catch(err){
+    alert("Screen capture failed: " + err);
+  }
+}
+
+// --- Speech ---
+function speakMessage(message){
+  const utterance = new SpeechSynthesisUtterance(message);
+  utterance.rate = 1;
+  window.speechSynthesis.speak(utterance);
+
+  if(navigator.vibrate) navigator.vibrate([200,100,200]);
+}
+
+// --- Speed Tracking ---
+function updateSpeed(position){
+  if(position.coords.speed!=null){
+    let speedKmh = position.coords.speed * 3.6;
+    speedDisplay.innerText = `Speed: ${speedKmh.toFixed(1)} km/h`;
+
+    let now = Date.now();
+    if(speedKmh > SPEED_LIMIT && (now - lastSpeedAlertTime > 5000)){
+      speakMessage(`Overspeed Alert! Your speed is ${speedKmh.toFixed(0)} kilometers per hour`);
+      lastSpeedAlertTime = now;
+    }
+  } else speedDisplay.innerText = "Speed: Calculating...";
+}
+
+// --- Automatic Night Vision ---
+function applyNightVision(){
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = video.videoWidth;
+  tempCanvas.height = video.videoHeight;
+  const tempCtx = tempCanvas.getContext('2d');
+  tempCtx.drawImage(video,0,0,tempCanvas.width,tempCanvas.height);
+
+  const frame = tempCtx.getImageData(0,0,tempCanvas.width,tempCanvas.height);
+  let total=0;
+  for(let i=0;i<frame.data.length;i+=4){
+    const r=frame.data[i], g=frame.data[i+1], b=frame.data[i+2];
+    total+=(r+g+b)/3;
+  }
+  const avgBrightness = total/(frame.data.length/4);
+
+  if(avgBrightness<60){ // low-light threshold
+    ctx.filter='brightness(1.5) contrast(1.3)';
+  } else {
+    ctx.filter='none';
+  }
+  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+}
+
+// --- Object Detection ---
+async function detectFrame(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // Auto night vision
+  applyNightVision();
+
+  if(!model) return;
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = DETECTION_WIDTH;
+  tempCanvas.height = DETECTION_HEIGHT;
+  const tempCtx = tempCanvas.getContext('2d');
+  tempCtx.drawImage(video,0,0,DETECTION_WIDTH,DETECTION_HEIGHT);
+
+  const predictions = await model.detect(tempCanvas);
+  let alertMessages=[];
+  let highAlertActive=false;
+
+  predictions.forEach(pred=>{
+    const scaleX = canvas.width / DETECTION_WIDTH;
+    const scaleY = canvas.height / DETECTION_HEIGHT;
+    const [x,y,w,h] = pred.bbox.map((v,i)=>i%2===0?v*scaleX:v*scaleY);
+
+    const boxSize = Math.max(w,h);
+    let direction='';
+    const centerX = x+w/2;
+    if(centerX<canvas.width/3) direction=' on the left';
+    else if(centerX>2*canvas.width/3) direction=' on the right';
+    else direction=' ahead';
+
+    if(boxSize>HIGH_ALERT_THRESHOLD && (pred.class==='car'||pred.class==='person')){
+      alertMessages.push('Stop! Stop! High Alert!'+direction);
+      highAlertActive=true;
+    } else if(boxSize>CLOSE_OBJECT_THRESHOLD && (pred.class==='car'||pred.class==='person')){
+      if(pred.class==='car') alertMessages.push('Incoming Car'+direction);
+      if(pred.class==='person') alertMessages.push('Incoming Pedestrian'+direction);
+    }
+
+    if(pred.class==='car'||pred.class==='person'){
+      ctx.strokeStyle='red';
+      ctx.lineWidth=4;
+      ctx.strokeRect(x,y,w,h);
+    }
+  });
+
+  alertText.innerText = alertMessages.join(' | ');
+  highOverlay.style.display = highAlertActive ? 'block' : 'none';
+
+  alertMessages.forEach(msg=>{
+    if(!spoken.has(msg)){
+      speakMessage(msg);
+      spoken.add(msg);
+      setTimeout(()=>spoken.delete(msg),2000);
+    }
+  });
+
+  requestAnimationFrame(detectFrame);
+}
+
+init();
+</script>
+</body>
+</html>
